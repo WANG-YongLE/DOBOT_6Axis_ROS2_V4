@@ -2,31 +2,63 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import rclpy                                                                      # ROS2 Python接口库
-from rclpy.node   import Node                                                     # ROS2 节点类
-from dobot_msgs_v4.srv import *   # 自定义的服务接口                                   
+import rclpy
+from rclpy.node import Node
+from dobot_msgs_v4.srv import *
+from std_msgs.msg import Float32MultiArray
 import time
+from trajectory_msgs.msg import JointTrajectoryPoint
+from dobot_demo.model import DeviceDataTypeEnum
+from std_msgs.msg import String
+
 
 class adderClient(Node):
     def __init__(self, name):
-        super().__init__(name)                                                    # ROS2节点父类初始化
-        self.EnableRobot_l = self.create_client(EnableRobot,'/dobot_bringup_ros2/srv/EnableRobot')
-        self.MovJ_l = self.create_client(MovJ,'/dobot_bringup_ros2/srv/MovJ')
-        self.SpeedFactor_l = self.create_client(SpeedFactor,'/dobot_bringup_ros2/srv/SpeedFactor')
-        self.MovL_l = self.create_client(MovL,'/dobot_bringup_ros2/srv/MovL')
-        self.DO_l = self.create_client(DO,'/dobot_bringup_ros2/srv/DO' )
-        while not self.EnableRobot_l.wait_for_service(timeout_sec=1.0):                  # 循环等待服务器端成功启动
-            self.get_logger().info('service not available, waiting again...') 
-                    
-    def initialization(self):  # 初始化：速度、坐标系、负载、工具偏心等
+        super().__init__(name)
+        self.EnableRobot_l = self.create_client(EnableRobot, '/dobot_bringup_ros2/srv/EnableRobot')
+        self.DisableRobot_l = self.create_client(DisableRobot, '/dobot_bringup_ros2/srv/DisableRobot')
+        self.MovJ_l = self.create_client(MovJ, '/dobot_bringup_ros2/srv/MovJ')
+        self.SpeedFactor_l = self.create_client(SpeedFactor, '/dobot_bringup_ros2/srv/SpeedFactor')
+        self.MovL_l = self.create_client(MovL, '/dobot_bringup_ros2/srv/MovL')
+        self.DO_l = self.create_client(DO, '/dobot_bringup_ros2/srv/DO')
+        self.DI_l = self.create_client(DI, '/dobot_bringup_ros2/srv/DI')
+        self.GetAngle_l = self.create_client(GetAngle, '/dobot_bringup_ros2/srv/GetAngle')
+        self.GetDOGroup_l = self.create_client(GetDOGroup, '/dobot_bringup_ros2/srv/GetDOGroup')
+        self.ok=False
+        while not self.EnableRobot_l.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('service not available, waiting again...')
+        
+        self.suscriber_ok = self.create_subscription(
+            String,
+            "/OK",
+            self.listener_callback,
+            10
+        )
+    def listener_callback(self, msg):
+        if(self.ok is False):
+            self.initialization()
+        else:
+            self.shutdown()
+    def initialization(self):
         response = self.EnableRobot_l.call_async(EnableRobot.Request())
         print(response)
         spe = SpeedFactor.Request()
-        spe.ratio = 10
+        spe.ratio = 2
         response = self.SpeedFactor_l.call_async(spe)
+        self.DO(1, 1)  # DO1 = ORG    
+        self.DO(3, 1)
+        self.ok=True
+ 
         print(response)
+    def shutdown(self):
+        response = self.DisableRobot_l.call_async(DisableRobot.Request())
+        print("關閉機器人")
+        print(response)
+        self.ok=False
+     
+        
 
-    def point(self, Move, X_j1, Y_j2, Z_j3, RX_j4, RY_j5, RZ_j6):  # 运动指令
+    def point(self, Move, X_j1, Y_j2, Z_j3, RX_j4, RY_j5, RZ_j6):
         if Move == "MovJ":
             P1 = MovJ.Request()
             P1.mode = True
@@ -50,22 +82,99 @@ class adderClient(Node):
             response = self.MovL_l.call_async(P1)
             print(response)
         else:
-            print("无该指令")
+            print("無該指令")
 
-    def DO(self, index, status):  # IO 控制夹爪/气泵
+    def DO(self, index, status,time=100):
         DO_V = DO.Request()
         DO_V.index = index
         DO_V.status = status
+        DO_V.time=time
         response = self.DO_l.call_async(DO_V)
         print(response)
+    def DI(self,index):
+        DI_V=DI.Request()
+        DI_V.index=index
 
+        future = self.DI_l.call_async(DI_V)
+        rclpy.spin_until_future_complete(self, future)
+        response = future.result()
+        return response
+
+    def GetAngle(self):
+        GetAngle_V = GetAngle.Request()
+        response = self.GetAngle_l.call_async(GetAngle_V)
+        return response
+    def GetDOGroup(self):
+        GetDOGroup_V=GetDOGroup.Request()
+        GetDOGroup_V.index_group = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        response=self.GetDOGroup_l.call_async(GetDOGroup_V)
+        return response
+    def start_point(self):
+        # 啟動 START 訊號
+        self.DO(4, 1)
+class RobotArmMonitor(Node):
+    def __init__(self, adder_client):
+        super().__init__('robot_arm_monitor')
+        self.joint = [0.0] * 6
+        self.client_node = adder_client
+        self.pre_craw = 0
+        self.suscriber_Mov = self.create_subscription(
+            JointTrajectoryPoint,
+            DeviceDataTypeEnum.robot_arm,
+            self.listener_callback,
+            10
+        )
+
+        self.publisher_joint_position = self.create_publisher(
+            Float32MultiArray,  #
+            DeviceDataTypeEnum.realrobot,     
+            10
+        )
+        # Set up a timer to publish joint angles and call GetDOGroup every 5 seconds
+        self.timer = self.create_timer(5.0, self.timer_callback)
+
+    def listener_callback(self, msg):
+        self.get_logger().info("listener_callback triggered")
+        self.joint = msg.positions[0:6]
+        self.craw=msg.positions[6]
+        self.client_node.point("MovJ", *self.joint)
+        
+        if(self.craw<0 and self.pre_craw>0) :
+            self.client_node.DO(6,1)
+            self.client_node.start_point()
+            self.pre_craw = self.craw
+        
+        if(self.craw>0) :
+            self.client_node.DO(1, 1)
+            self.pre_craw = self.craw
+
+    def timer_callback(self):
+        angles = self.position_returner()
+        # ✅ 發佈 joint angles
+        msg = Float32MultiArray()
+        msg.data = angles
+        self.publisher_joint_position.publish(msg)
+        self.client_node.GetDOGroup()
+
+    def position_returner(self):
+        future = self.client_node.GetAngle()
+        rclpy.spin_until_future_complete(self.client_node, future)
+        if future.done():
+            result = future.result()
+            angles = [float(x) for x in result.robot_return.strip('{}').split(',')]
+            return angles
+        else:
+            return []
 
 def main(args=None):
-    rclpy.init(args=args)                                                         # ROS2 Python接口初始化
-    node = adderClient("service_adder_client")                                    # 创建ROS2节点对象并进行初始化
-    #node.send_request()                                                           # 发送服务请求
-    node.point("MovJ", 50, -8, 0, 0, 0, 0)
-    node.point("MovJ", 0, -8, 0, 0, 0, 0)  
-    time.sleep(3)  
-    node.destroy_node()                                                           # 销毁节点对象
-    rclpy.shutdown()                                                              # 关闭ROS2 Python接口
+    rclpy.init(args=args)
+    node = adderClient('adder_client')
+    node.GetDOGroup()
+    monitor = RobotArmMonitor(node)
+
+    rclpy.spin(monitor)
+    monitor.get_logger().info("Shutting down RobotArmMonitor.")
+    node.get_logger().info("Shutting down AdderClient.")
+    monitor.destroy_node()
+    node.destroy_node()
+    rclpy.shutdown()
